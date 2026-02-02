@@ -3,6 +3,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart';
 import 'location_picker_screen.dart';
 import '../../services/auth_service.dart';
+import '../../models/user.dart' as user_model;
 
 class CompleteProfileScreen extends StatefulWidget {
   final String phone;
@@ -82,11 +83,14 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _isLoading = true);
     try {
-      await AuthService.instance.createOrUpdateUserProfile(
+      final user = user_model.User(
+        id: AuthService.instance.currentUser!.uid,
         phone: widget.phone,
         fullName: _nameController.text.trim(),
-        // Add more fields as needed
+        role: 'customer', // Default, should probably pass from signup flow
+        createdAt: DateTime.now(),
       );
+      await AuthService.instance.createOrUpdateUserProfile(user);
       if (mounted) {
         Navigator.pushReplacementNamed(context, '/customer-home-screen');
       }

@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:sizer/sizer.dart';
 import '../../services/auth_service.dart';
+import '../../routes/app_routes.dart';
 import 'widgets/otp_pin_field.dart';
-import 'complete_profile_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({Key? key}) : super(key: key);
@@ -13,210 +14,178 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
+  final AuthService _authService = AuthService();
   bool _isLoading = false;
   bool _isOtpStep = false;
   String _phone = '';
+  String? _verificationId;
   final TextEditingController _otpController = TextEditingController();
+  final TextEditingController _phoneController = TextEditingController();
 
   Future<void> _handleSendOtp() async {
+    if (_phone.length < 10) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Invalid Phone Number')));
+      return;
+    }
     setState(() => _isLoading = true);
+    
+    // Format phone number (Assuming India +91 for now as per previous code)
+    String formattedPhone = '+91${_phone.replaceAll(RegExp(r'[^0-9]'), '')}';
+    if (formattedPhone.length < 13) { 
+        // Simple check +91 + 10 digits
+        formattedPhone = _phone.startsWith('+') ? _phone : '+91$_phone';
+    }
+
     try {
-      await AuthService.instance.signInWithPhone(_phone);
-      setState(() => _isOtpStep = true);
-      _showErrorMessage('OTP sent to $_phone');
+      await _authService.verifyPhoneNumber(
+        phoneNumber: formattedPhone,
+        onCodeSent: (verificationId, resendToken) {
+          if (!mounted) return;
+          setState(() {
+            _verificationId = verificationId;
+            _isOtpStep = true;
+            _isLoading = false;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('OTP sent to $formattedPhone')));
+        },
+        onVerificationFailed: (e) {
+             if (!mounted) return;
+             setState(() => _isLoading = false);
+             ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Verification Failed: ${e.message}')));
+        },
+        onCodeAutoRetrievalTimeout: (id) => _verificationId = id,
+      );
     } catch (e) {
-      _showErrorMessage('Failed to send OTP. Please try again.');
-    } finally {
-      setState(() => _isLoading = false);
+         if (!mounted) return;
+         setState(() => _isLoading = false);
+         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to send OTP')));
     }
   }
 
   Future<void> _handleVerifyOtp() async {
+    if (_verificationId == null || _otpController.text.length != 6) return;
+
     setState(() => _isLoading = true);
     try {
-      final response = await AuthService.instance
-          .verifyOtp(phone: _phone, token: _otpController.text.trim());
-      if (response.user != null) {
-        HapticFeedback.mediumImpact();
-        // Check if user profile exists in users table
-        final profile = await AuthService.instance.getUserProfile();
-        if (profile != null) {
-          // Profile exists, go directly to home
-          Navigator.pushReplacementNamed(context, '/customer-home-screen');
+      UserCredential cred = await _authService.signInWithOTP(
+        verificationId: _verificationId!,
+        smsCode: _otpController.text.trim(),
+      );
+
+      if (cred.user != null) {
+        // Check Role
+        String? role = await _authService.getUserRole(cred.user!.uid);
+        if (!mounted) return;
+
+        if (role != null) {
+          // Navigate based on role
+           switch (role) {
+            case 'vendor':
+              Navigator.pushNamedAndRemoveUntil(context, AppRoutes.vendorHome, (route) => false);
+              break;
+            case 'freelancer':
+              Navigator.pushNamedAndRemoveUntil(context, AppRoutes.freelancerHome, (route) => false);
+              break;
+            case 'customer':
+            default:
+              Navigator.pushNamedAndRemoveUntil(context, AppRoutes.customerHome, (route) => false);
+              break;
+          }
         } else {
-          // No profile, go to complete profile
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(
-              builder: (context) => CompleteProfileScreen(phone: _phone),
-            ),
-          );
+          // New User -> Role Selection
+          Navigator.pushNamedAndRemoveUntil(context, AppRoutes.roleSelection, (route) => false);
         }
-      } else {
-        _showErrorMessage('Invalid OTP. Please try again.');
       }
     } catch (e) {
-      _showErrorMessage('OTP verification failed. Please try again.');
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Invalid OTP: $e')));
     } finally {
-      setState(() => _isLoading = false);
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
-  void _showErrorMessage(String message) {
-    // No-op: console messages/snackbars removed as per request
-  }
-
-  void _navigateToSignUp() {
-    Navigator.pushNamed(context, '/onboarding-flow');
+  void _handleSkip() {
+    // Skip logic - Assume Customer Guest? Or just go to Role Selection?
+    // User requested: "even they can skip initially"
+    // Usually "Skip" implies browsing as Guest (Customer).
+    Navigator.pushNamed(context, AppRoutes.customerHome); 
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      appBar: AppBar(
+        automaticallyImplyLeading: false,
+        actions: [
+          TextButton(
+            onPressed: _handleSkip,
+            child: const Text('Skip', style: TextStyle(fontWeight: FontWeight.bold)),
+          )
+        ],
+      ),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: EdgeInsets.symmetric(horizontal: 6.w),
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              minHeight: MediaQuery.of(context).size.height -
-                  MediaQuery.of(context).padding.top -
-                  MediaQuery.of(context).padding.bottom,
-            ),
-            child: IntrinsicHeight(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  SizedBox(height: 8.h),
-                  // App Logo
-                  Container(
-                    width: 25.w,
-                    height: 25.w,
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).primaryColor,
-                      borderRadius: BorderRadius.circular(20),
-                      boxShadow: [
-                        BoxShadow(
-                          color:
-                              Theme.of(context).primaryColor.withOpacity(0.3),
-                          blurRadius: 20,
-                          offset: Offset(0, 8),
-                        ),
-                      ],
-                    ),
-                    child: Center(
-                      child: Text(
-                        'J',
-                        style:
-                            Theme.of(context).textTheme.displayMedium?.copyWith(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                      ),
-                    ),
-                  ),
-                  SizedBox(height: 3.h),
-                  // Welcome Text
-                  Text(
-                    'Welcome to Jayple',
-                    style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                          fontWeight: FontWeight.w700,
-                          color: Theme.of(context).colorScheme.onSurface,
-                        ),
-                  ),
-                  SizedBox(height: 1.h),
-                  Text(
-                    'Your trusted salon & grooming partner',
-                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                        ),
-                  ),
-                  SizedBox(height: 6.h),
-                  // Phone Login Step
-                  if (!_isOtpStep) ...[
-                    TextField(
-                      keyboardType: TextInputType.phone,
-                      decoration: InputDecoration(
-                        labelText: 'Phone Number',
-                        prefixText: '+91 ',
-                        border: OutlineInputBorder(),
-                      ),
-                      onChanged: (val) => _phone =
-                          '+91${val.replaceAll(RegExp(r'[^0-9]'), '')}',
-                      enabled: !_isLoading,
-                    ),
-                    SizedBox(height: 2.h),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton(
-                        onPressed: _isLoading ? null : _handleSendOtp,
-                        child: _isLoading
-                            ? CircularProgressIndicator()
-                            : Text('Send OTP'),
-                      ),
-                    ),
-                  ]
-                  // OTP Step
-                  else ...[
-                    OtpPinField(
-                      controller: _otpController,
-                      enabled: !_isLoading,
-                      onCompleted: (val) {
-                        if (val.length == 6 && !_isLoading) _handleVerifyOtp();
-                      },
-                    ),
-                    SizedBox(height: 2.h),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton(
-                        onPressed: _isLoading ? null : _handleVerifyOtp,
-                        child: _isLoading
-                            ? CircularProgressIndicator()
-                            : Text('Verify OTP'),
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: _isLoading
-                          ? null
-                          : () => setState(() => _isOtpStep = false),
-                      child: Text('Edit phone number'),
-                    ),
-                  ],
-                  Spacer(),
-                  // Sign Up Link
-                  Padding(
-                    padding: EdgeInsets.only(bottom: 4.h),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Text(
-                          'New user? ',
-                          style:
-                              Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .onSurfaceVariant,
-                                  ),
-                        ),
-                        GestureDetector(
-                          onTap: _isLoading ? null : _navigateToSignUp,
-                          child: Text(
-                            'Sign Up',
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(
-                                  color: Theme.of(context).primaryColor,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              SizedBox(height: 5.h),
+              Icon(Icons.phone_android, size: 80, color: Theme.of(context).primaryColor),
+              SizedBox(height: 3.h),
+              Text(
+                'Welcome to Jayple',
+                style: Theme.of(context).textTheme.headlineMedium,
               ),
-            ),
+              const SizedBox(height: 10),
+              Text(
+                'Enter your phone number to continue',
+                style: Theme.of(context).textTheme.bodyLarge,
+              ),
+              SizedBox(height: 6.h),
+              
+              if (!_isOtpStep) ...[
+                TextField(
+                  controller: _phoneController,
+                  keyboardType: TextInputType.phone,
+                  decoration: const InputDecoration(
+                    labelText: 'Phone Number',
+                    prefixText: '+91 ',
+                    border: OutlineInputBorder(),
+                  ),
+                  onChanged: (val) => _phone = val,
+                ),
+                SizedBox(height: 2.h),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _isLoading ? null : _handleSendOtp,
+                    style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
+                    child: _isLoading ? const CircularProgressIndicator() : const Text('Send OTP'),
+                  ),
+                ),
+              ] else ...[
+                OtpPinField(
+                  controller: _otpController,
+                  enabled: !_isLoading,
+                  onCompleted: (val) {
+                    if (val.length == 6 && !_isLoading) _handleVerifyOtp();
+                  },
+                ),
+                SizedBox(height: 2.h),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _isLoading ? null : _handleVerifyOtp,
+                    style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
+                    child: _isLoading ? const CircularProgressIndicator() : const Text('Verify OTP'),
+                  ),
+                ),
+                TextButton(
+                  onPressed: _isLoading ? null : () => setState(() => _isOtpStep = false),
+                  child: const Text('Change Phone Number'),
+                ),
+              ],
+            ],
           ),
         ),
       ),

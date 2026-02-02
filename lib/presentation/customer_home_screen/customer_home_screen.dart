@@ -7,6 +7,8 @@ import '../../models/salon.dart';
 import '../../models/user.dart' as user_model;
 import '../../services/auth_service.dart';
 import '../../services/salon_service.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import './widgets/empty_state_widget.dart';
 import './widgets/freelancer_card.dart';
 import './widgets/location_header.dart';
@@ -91,8 +93,18 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
 
   Future<void> _loadCurrentUser() async {
     try {
-      _currentUser = AuthService.instance.currentUser;
-      if (mounted) setState(() {});
+      final firebaseUser = FirebaseAuth.instance.currentUser;
+      if (firebaseUser != null) {
+        final doc = await FirebaseFirestore.instance.collection('users').doc(firebaseUser.uid).get();
+        if (doc.exists) {
+            final data = doc.data()!;
+            // Ensure ID is set
+            data['id'] = firebaseUser.uid; 
+            if (mounted) setState(() {
+                _currentUser = user_model.User.fromJson(data);
+            });
+        }
+      }
     } catch (error) {
       debugPrint('Failed to load user: $error');
     }

@@ -33,43 +33,51 @@ class _LoginFormWidgetState extends State<LoginFormWidget> {
     super.dispose();
   }
 
+  String? _verificationId;
+
   Future<void> _handleSendOtp() async {
     setState(() => _isLoading = true);
-    try {
-      final phone =
-          '+91${_phoneController.text.replaceAll(RegExp(r'[^0-9]'), '')}';
-      await AuthService.instance.signInWithPhone(phone);
-      setState(() => _isOtpStep = true);
-      _showMessage('OTP sent to $phone');
-    } catch (e, stack) {
-      String errorMsg = 'Failed to send OTP. Please try again.';
-      if (e is Exception) {
-        errorMsg = e.toString();
-      }
-      debugPrint('OTP SEND ERROR: $e\n$stack');
-      _showMessage(errorMsg);
-    } finally {
-      setState(() => _isLoading = false);
-    }
+    final phone = '+91${_phoneController.text.replaceAll(RegExp(r'[^0-9]'), '')}';
+    
+    await AuthService.instance.verifyPhoneNumber(
+      phoneNumber: phone,
+      onCodeSent: (verificationId, resendToken) {
+        if (!mounted) return;
+        setState(() {
+          _verificationId = verificationId;
+          _isOtpStep = true;
+          _isLoading = false;
+        });
+        _showMessage('OTP sent to $phone');
+      },
+      onVerificationFailed: (e) {
+        if (!mounted) return;
+        setState(() => _isLoading = false);
+        _showMessage('Verification failed: ${e.message}');
+      },
+      onCodeAutoRetrievalTimeout: (verificationId) {
+        _verificationId = verificationId;
+      },
+    );
   }
 
   Future<void> _handleVerifyOtp() async {
+    if (_verificationId == null) return;
     setState(() => _isLoading = true);
     try {
-      final phone =
-          '+91${_phoneController.text.replaceAll(RegExp(r'[^0-9]'), '')}';
-      final response = await AuthService.instance
-          .verifyOtp(phone: phone, token: _otpController.text.trim());
-      if (response.user != null) {
+      final credential = await AuthService.instance.signInWithOTP(
+        verificationId: _verificationId!,
+        smsCode: _otpController.text.trim(),
+      );
+      
+      if (credential.user != null) {
         HapticFeedback.mediumImpact();
         widget.onLoginSuccess?.call();
-      } else {
-        _showMessage('Invalid OTP. Please try again.');
       }
     } catch (e) {
-      _showMessage('OTP verification failed. Please try again.');
+      _showMessage('OTP verification failed: $e');
     } finally {
-      setState(() => _isLoading = false);
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 

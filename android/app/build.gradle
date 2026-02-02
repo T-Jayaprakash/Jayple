@@ -1,5 +1,8 @@
 plugins {
     id "com.android.application"
+    // START: FlutterFire Configuration
+    id 'com.google.gms.google-services'
+    // END: FlutterFire Configuration
     id "kotlin-android"
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id "dev.flutter.flutter-gradle-plugin"
@@ -30,7 +33,7 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
         multiDexEnabled true
-        minSdkVersion 23
+        minSdkVersion flutter.minSdkVersion
     }
 
     buildTypes {
@@ -53,4 +56,24 @@ dependencies {
     implementation "androidx.multidex:multidex:2.0.1"
     implementation 'com.google.android.material:material:1.9.0'
     implementation 'androidx.concurrent:concurrent-futures:1.1.0'
+}
+
+configurations.all {
+    resolutionStrategy {
+        force 'androidx.core:core:1.13.1'
+        force 'androidx.core:core-ktx:1.13.1'
+        force 'androidx.credentials:credentials:1.2.2'
+        force 'androidx.credentials:credentials-play-services-auth:1.2.2'
+        force 'androidx.activity:activity:1.9.3'
+        force 'androidx.activity:activity-ktx:1.9.3'
+        
+        eachDependency { details ->
+            if (details.requested.group == 'androidx.navigationevent') {
+                details.useVersion '1.0.0-alpha01' // Try to downgrade or nullify?
+                                                  // Actually better to exclude it if possible, but strict resolution helps.
+            }
+        }
+    }
+    
+    exclude group: 'androidx.navigationevent', module: 'navigationevent-android'
 }

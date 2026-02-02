@@ -1,0 +1,23 @@
+# Dependency directories
+node_modules/
+
+# Local Firebase config
+.runtimeconfig.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

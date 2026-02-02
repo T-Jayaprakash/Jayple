@@ -1,3 +1,5 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+
 class User {
   final String id;
   final String? email;
@@ -29,7 +31,9 @@ class User {
       role: json['role'] as String? ?? 'customer',
       verified: json['verified'] as bool? ?? false,
       createdAt: json['created_at'] != null
-          ? DateTime.parse(json['created_at'] as String)
+          ? (json['created_at'] is Timestamp 
+              ? (json['created_at'] as Timestamp).toDate() 
+              : DateTime.parse(json['created_at'].toString()))
           : null,
     );
   }

@@ -1,0 +1,53 @@
+{
+    "flutter": {
+        "platforms": {
+            "android": {
+                "default": {
+                    "projectId": "jayple-app-2026",
+                    "appId": "1:152751512014:android:a6041a486bcd3064e4739f",
+                    "fileOutput": "android/app/google-services.json"
+                }
+            },
+            "macos": {
+                "default": {
+                    "projectId": "jayple-app-2026",
+                    "appId": "1:152751512014:ios:10deded596f004fae4739f",
+                    "uploadDebugSymbols": false,
+                    "fileOutput": "macos/Runner/GoogleService-Info.plist"
+                }
+            },
+            "dart": {
+                "lib/firebase_options.dart": {
+                    "projectId": "jayple-app-2026",
+                    "configurations": {
+                        "android": "1:152751512014:android:a6041a486bcd3064e4739f",
+                        "macos": "1:152751512014:ios:10deded596f004fae4739f"
+                    }
+                }
+            }
+        }
+    },
+    "firestore": {
+        "rules": "firestore.rules"
+    },
+    "functions": {
+        "source": "functions",
+        "runtime": "nodejs18"
+    },
+    "emulators": {
+        "functions": {
+            "port": 5002
+        },
+        "firestore": {
+            "port": 8081
+        },
+        "auth": {
+            "port": 9098
+        },
+        "ui": {
+            "enabled": true,
+            "port": 4001
+        },
+        "singleProjectMode": true
+    }
+}

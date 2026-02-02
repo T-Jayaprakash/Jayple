@@ -4,6 +4,7 @@ import 'package:sizer/sizer.dart';
 
 import '../../../core/app_export.dart';
 import '../../services/auth_service.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -98,11 +99,19 @@ class _SplashScreenState extends State<SplashScreen>
     await Future.delayed(const Duration(milliseconds: 500));
   }
 
-  void _navigateToNextScreen() {
+  Future<void> _navigateToNextScreen() async {
     HapticFeedback.lightImpact();
-    final isAuthenticated = AuthService.instance.isAuthenticated;
-    if (isAuthenticated) {
-      Navigator.pushReplacementNamed(context, '/customer-home-screen');
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      // Check role
+      final role = await AuthService().getUserRole(user.uid);
+      if (role == 'vendor') {
+         Navigator.pushReplacementNamed(context, '/vendor-home-screen');
+      } else if (role == 'freelancer') {
+         Navigator.pushReplacementNamed(context, '/freelancer-home-screen');
+      } else {
+         Navigator.pushReplacementNamed(context, '/customer-home-screen');
+      }
     } else {
       Navigator.pushReplacementNamed(context, '/login-screen');
     }

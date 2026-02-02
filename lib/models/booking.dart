@@ -1,3 +1,5 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+
 class Booking {
   final String id;
   final String? userId;
@@ -35,7 +37,9 @@ class Booking {
       status: json['status'] as String? ?? 'pending',
       homeService: json['home_service'] as bool? ?? false,
       createdAt: json['created_at'] != null
-          ? DateTime.parse(json['created_at'] as String)
+          ? (json['created_at'] is Timestamp 
+              ? (json['created_at'] as Timestamp).toDate() 
+              : DateTime.parse(json['created_at'].toString()))
           : null,
     );
   }

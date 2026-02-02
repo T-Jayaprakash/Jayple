@@ -1,0 +1,160 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // ========================================
+    // USERS
+    // ========================================
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['name', 'photo', 'activeRole', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // ========================================
+    // VENDORS (City-Scoped)
+    // ========================================
+    match /cities/{cityId}/vendors/{vendorId} {
+      allow read: if true;
+      allow create: if false;
+      allow update: if isSignedIn()
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'shopName',
+            'images',
+            'description',
+            'businessHours',
+            'autoAccept',
+            'updatedAt'
+          ]);
+      allow delete: if false;
+    }
+
+    // ========================================
+    // FREELANCERS (City-Scoped)
+    // ========================================
+    match /cities/{cityId}/freelancers/{freelancerId} {
+      allow read: if true;
+      allow create: if false;
+      allow update: if isSignedIn()
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'isOnline',
+            'availability',
+            'updatedAt'
+          ]);
+      allow delete: if false;
+    }
+
+    // ========================================
+    // BOOKINGS (City-Scoped) - Cloud Functions ONLY
+    // ========================================
+    match /cities/{cityId}/bookings/{bookingId} {
+      // Allow read if user is involved in the booking
+      allow read: if isSignedIn()
+        && (
+          request.auth.uid == resource.data.customerId ||
+          request.auth.uid == resource.data.vendorId ||
+          request.auth.uid == resource.data.freelancerId ||
+          isAdmin()
+        );
+      // ALL writes via Cloud Functions only (Admin SDK bypasses rules)
+      allow create, update, delete: if false;
+
+      // Status events subcollection
+      match /status_events/{eventId} {
+        allow read: if isSignedIn()
+          && (
+            get(/databases/$(database)/documents/cities/$(cityId)/bookings/$(bookingId)).data.customerId == request.auth.uid ||
+            get(/databases/$(database)/documents/cities/$(cityId)/bookings/$(bookingId)).data.vendorId == request.auth.uid ||
+            get(/databases/$(database)/documents/cities/$(cityId)/bookings/$(bookingId)).data.freelancerId == request.auth.uid ||
+            isAdmin()
+          );
+        allow write: if false;
+      }
+
+      // Assignment attempts subcollection
+      match /assignment_attempts/{attemptId} {
+        allow read: if isSignedIn()
+          && (
+            get(/databases/$(database)/documents/cities/$(cityId)/bookings/$(bookingId)).data.customerId == request.auth.uid ||
+            get(/databases/$(database)/documents/cities/$(cityId)/bookings/$(bookingId)).data.freelancerId == request.auth.uid ||
+            isAdmin()
+          );
+        allow write: if false;
+      }
+    }
+
+    // ========================================
+    // LEDGER - Cloud Functions ONLY
+    // ========================================
+    match /ledger/{ledgerId} {
+      allow read: if isSignedIn()
+        && request.auth.uid == resource.data.userId;
+      allow write: if false;
+    }
+
+    // ========================================
+    // SETTLEMENTS - Cloud Functions ONLY
+    // ========================================
+    match /settlements/{settlementId} {
+      allow read: if isSignedIn()
+        && request.auth.uid == resource.data.userId;
+      allow write: if false;
+    }
+
+    // ========================================
+    // REVIEWS - Cloud Functions ONLY for writes
+    // ========================================
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create, update, delete: if false;
+    }
+
+    // ========================================
+    // SERVICES (City-Scoped) - Read only
+    // ========================================
+    match /cities/{cityId}/services/{serviceId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ========================================
+    // ADMIN CONFIG
+    // ========================================
+    match /admin/{document=**} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /admins/{adminId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ========================================
+    // DEFAULT DENY
+    // ========================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
