@@ -433,6 +433,171 @@ exports.getBookingById = functions.https.onCall(async (data, context) => {
 });
 
 // ============================================
+// VENDOR BOOKING FUNCTIONS
+// ============================================
+
+/**
+ * Vendor responds to an in-shop booking (ACCEPT or REJECT)
+ * 
+ * Only handles in-shop bookings.
+ * Uses transaction to prevent race conditions.
+ * 
+ * @param {Object} data - { bookingId, cityId, action }
+ * @param {string} data.bookingId - Booking ID
+ * @param {string} data.cityId - City ID
+ * @param {string} data.action - "ACCEPT" or "REJECT"
+ */
+exports.vendorRespondToBooking = functions.https.onCall(async (data, context) => {
+    // 1. Require authentication
+    const uid = requireAuth(context);
+
+    functions.logger.info('vendorRespondToBooking called', { uid, data });
+
+    // 2. Validate input
+    const { bookingId, cityId, action } = data;
+
+    if (!bookingId || typeof bookingId !== 'string') {
+        throw new functions.https.HttpsError(
+            'invalid-argument',
+            'bookingId is required and must be a string.'
+        );
+    }
+
+    if (!cityId || typeof cityId !== 'string') {
+        throw new functions.https.HttpsError(
+            'invalid-argument',
+            'cityId is required and must be a string.'
+        );
+    }
+
+    if (!action || !['ACCEPT', 'REJECT'].includes(action)) {
+        throw new functions.https.HttpsError(
+            'invalid-argument',
+            'action is required and must be "ACCEPT" or "REJECT".'
+        );
+    }
+
+    // 3. Validate user is a vendor
+    const userDoc = await db.doc(`users/${uid}`).get();
+
+    if (!userDoc.exists) {
+        throw new functions.https.HttpsError(
+            'failed-precondition',
+            'User profile not found.'
+        );
+    }
+
+    const userData = userDoc.data();
+
+    if (userData.activeRole !== 'vendor') {
+        functions.logger.warn('User is not in vendor role', { uid, activeRole: userData.activeRole });
+        throw new functions.https.HttpsError(
+            'permission-denied',
+            'You must be in vendor role to respond to bookings.'
+        );
+    }
+
+    // Get vendor's salonId (could be stored in user doc or be the uid itself)
+    const vendorSalonId = userData.salonId || userData.vendorId || uid;
+
+    // 4. Process in transaction
+    const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
+
+    try {
+        const result = await db.runTransaction(async (transaction) => {
+            // Fetch booking
+            const bookingDoc = await transaction.get(bookingRef);
+
+            if (!bookingDoc.exists) {
+                throw new functions.https.HttpsError(
+                    'not-found',
+                    'Booking not found.'
+                );
+            }
+
+            const bookingData = bookingDoc.data();
+
+            // Validate booking type is in-shop
+            if (bookingData.type !== 'inShop') {
+                throw new functions.https.HttpsError(
+                    'failed-precondition',
+                    'This function only handles in-shop bookings.'
+                );
+            }
+
+            // Validate booking status is CREATED
+            if (bookingData.status !== 'CREATED') {
+                throw new functions.https.HttpsError(
+                    'failed-precondition',
+                    `Booking cannot be ${action.toLowerCase()}ed. Current status: ${bookingData.status}`
+                );
+            }
+
+            // Validate booking belongs to this vendor
+            if (bookingData.salonId !== vendorSalonId && bookingData.vendorId !== uid) {
+                functions.logger.warn('Vendor does not own this booking', {
+                    uid,
+                    vendorSalonId,
+                    bookingSalonId: bookingData.salonId,
+                    bookingVendorId: bookingData.vendorId
+                });
+                throw new functions.https.HttpsError(
+                    'permission-denied',
+                    'You do not have permission to respond to this booking.'
+                );
+            }
+
+            // Determine new status
+            const newStatus = action === 'ACCEPT' ? 'CONFIRMED' : 'REJECTED';
+            const now = FieldValue.serverTimestamp();
+
+            // Update booking
+            transaction.update(bookingRef, {
+                status: newStatus,
+                updatedAt: now,
+            });
+
+            // Create status event
+            const statusEventRef = bookingRef.collection('status_events').doc();
+            transaction.set(statusEventRef, {
+                from: 'CREATED',
+                to: newStatus,
+                actor: 'vendor',
+                actorId: uid,
+                timestamp: now,
+            });
+
+            return { bookingId, status: newStatus };
+        });
+
+        functions.logger.info('Vendor responded to booking', {
+            uid,
+            bookingId,
+            action,
+            newStatus: result.status
+        });
+
+        return result;
+
+    } catch (error) {
+        // Re-throw HttpsErrors
+        if (error instanceof functions.https.HttpsError) {
+            throw error;
+        }
+        functions.logger.error('Failed to process vendor response', {
+            uid,
+            bookingId,
+            action,
+            error: error.message
+        });
+        throw new functions.https.HttpsError(
+            'internal',
+            'Failed to process response. Please try again.'
+        );
+    }
+});
+
+// ============================================
 // PLACEHOLDER FUNCTIONS (NOT IMPLEMENTED)
 // ============================================
 
