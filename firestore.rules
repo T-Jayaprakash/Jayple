@@ -151,6 +151,22 @@ service cloud.firestore {
     }
 
     // ========================================
+    // SETTLEMENTS
+    // ========================================
+    match /settlements/{settlementId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
+    // ========================================
+    // BLOCKED ACCOUNTS
+    // ========================================
+    match /blocked_accounts/{userId} {
+      allow read: if isOwner(userId);
+      allow write: if false;
+    }
+
+    // ========================================
     // LEDGER
     // ========================================
     match /ledger/{ledgerId} {
