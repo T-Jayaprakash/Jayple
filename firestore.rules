@@ -151,7 +151,16 @@ service cloud.firestore {
     }
 
     // ========================================
+    // LEDGER
+    // ========================================
+    match /ledger/{ledgerId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
+    // ========================================
     // DEFAULT DENY
+
     // ========================================
     match /{document=**} {
       allow read, write: if false;

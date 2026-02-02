@@ -184,16 +184,70 @@ async function capturePayment(transaction, bookingRef, bookingData) {
     });
 }
 
+// ============================================
+// LEDGER HELPERS
+// ============================================
+
+async function getLedgerInfo(t, userId) {
+    const snap = await t.get(db.collection('ledger').where('userId', '==', userId).orderBy('createdAt', 'desc').limit(1));
+    if (snap.empty) return { balance: 0 };
+    return { balance: snap.docs[0].data().balanceAfter };
+}
+
+function writeLedgerEntry(t, ref, data) {
+    t.set(ref, data);
+}
+
+// ============================================
+
 async function processRefund(transaction, bookingRef, bookingData) {
     const payment = bookingData.payment;
     if (payment.status !== 'CAPTURED') throw new functions.https.HttpsError('failed-precondition', 'Payment not CAPTURED');
     if (payment.mode === 'OFFLINE') throw new functions.https.HttpsError('failed-precondition', 'Cannot refund OFFLINE');
 
     const now = Timestamp.now();
+
+    // Ledger Logic: Refund (Must Read First)
+    const providerId = bookingData.freelancerId || bookingData.salonId;
+    const providerType = bookingData.freelancerId ? 'freelancer' : 'vendor';
+
+    const refundId = `${bookingData.bookingId}_REFUND`;
+    const refundRef = db.collection('ledger').doc(refundId);
+
+    const ledgerSnap = await transaction.get(db.collection('ledger').where('userId', '==', providerId).orderBy('createdAt', 'desc').limit(1));
+    const refundDoc = await transaction.get(refundRef);
+
+    let currentBalance = 0;
+    if (!ledgerSnap.empty) currentBalance = ledgerSnap.docs[0].data().balanceAfter;
+
+    const amount = bookingData.payment.amount; // Refund Full Amount
+
+    // Write Ledger
+    if (!refundDoc.exists) {
+        const newBalance = currentBalance - amount; // Debit
+        transaction.set(refundRef, {
+            ledgerId: refundId,
+            userId: providerId,
+            userType: providerType,
+            bookingId: bookingData.bookingId,
+            entryType: 'REFUND',
+            direction: 'DEBIT',
+            amount: amount,
+            paymentMode: payment.mode,
+            paymentStatusAtEvent: 'REFUNDED',
+            balanceBefore: currentBalance,
+            balanceAfter: newBalance,
+            idempotencyKey: refundId,
+            metadata: { triggeredBy: 'system', reason: 'Refund' },
+            createdAt: now
+        });
+    }
+
+    // Write Payment Update
     const newPayment = {
         ...payment,
         status: 'REFUNDED',
-        providerRef: `MOCK_REFUND_${now.toMillis()}`, // Mock Refund Ref
+        providerRef: `MOCK_REFUND_${now.toMillis()}`,
         updatedAt: now
     };
 
@@ -246,7 +300,7 @@ exports.authorizePayment = functions.https.onCall(async (data, context) => {
 });
 
 exports.failPayment = functions.https.onCall(async (data, context) => {
-    requireAuth(context); // System/Internal user in production, any Auth in mock
+    requireAuth(context);
     const { bookingId, cityId } = data;
     const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
 
@@ -271,11 +325,9 @@ exports.failPayment = functions.https.onCall(async (data, context) => {
 
             t.update(bookingRef, { status: 'FAILED', failureReason: 'PAYMENT_FAILED', payment: newPayment, updatedAt: now });
 
-            // Payment Event
             t.set(bookingRef.collection('status_events').doc(), {
                 from: 'PAYMENT_AUTHORIZED', to: 'PAYMENT_FAILED', actor: 'system', timestamp: now
             });
-            // Booking Event
             t.set(bookingRef.collection('status_events').doc(), {
                 from: d.status, to: 'FAILED', actor: 'system', reason: 'PAYMENT_FAILED', timestamp: now
             });
@@ -493,38 +545,6 @@ exports.freelancerRespondToBooking = functions.https.onCall(async (data, context
     }
 });
 
-exports.onFreelancerAssignmentTimeout = functions.tasks.taskQueue({
-    retryConfig: { maxAttempts: 1 },
-    rateLimits: { maxConcurrentDispatches: 6 }
-}).onDispatch(async (data) => {
-    const { bookingId, cityId } = data;
-    const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
-
-    try {
-        await db.runTransaction(async (t) => {
-            const doc = await t.get(bookingRef);
-            if (!doc.exists) return;
-            const d = doc.data();
-
-            if (d.status === 'ASSIGNED') {
-                const replacementResult = await findReplacement(t, d);
-                const now = Timestamp.now();
-
-                t.set(bookingRef.collection('status_events').doc(), {
-                    from: 'ASSIGNED', to: 'TIMEOUT', actor: 'system', timestamp: now
-                });
-
-                writeReassignment(t, bookingRef, d, replacementResult, now);
-            }
-        });
-
-        const outputDoc = await bookingRef.get();
-        if (outputDoc.exists && outputDoc.data().status === 'ASSIGNED') {
-            await enqueueAssignmentTimeout(bookingId, cityId);
-        }
-    } catch (e) { }
-});
-
 exports.vendorRespondToBooking = functions.https.onCall(async (data, context) => {
     const uid = requireAuth(context);
     const { bookingId, cityId, action } = data;
@@ -562,10 +582,57 @@ exports.completeBooking = functions.https.onCall(async (data, context) => {
 
             const now = Timestamp.now();
 
+            // Ledger Logic: Earning & Commission checks (Must Read First)
+            const providerId = d.freelancerId || d.salonId;
+            const providerType = d.freelancerId ? 'freelancer' : 'vendor';
+            const amount = d.payment ? d.payment.amount : 0; // Or fetch service price if payment obj missing (offline)
+            // Note: If OFFLINE, payment obj exists with amount.
+
+            const earningId = `${bookingId}_EARNING`;
+            const commId = `${bookingId}_COMMISSION`;
+
+            const earningRef = db.collection('ledger').doc(earningId);
+            const commRef = db.collection('ledger').doc(commId);
+            const ledgerSnap = await t.get(db.collection('ledger').where('userId', '==', providerId).orderBy('createdAt', 'desc').limit(1));
+
+            const earningDoc = await t.get(earningRef);
+            // const commDoc = await t.get(commRef);
+
+            // Writes
             t.update(bookingRef, { status: 'COMPLETED', updatedAt: now });
             t.set(bookingRef.collection('status_events').doc(), {
                 from: d.status, to: 'COMPLETED', actor: 'provider', actorId: uid, timestamp: now
             });
+
+            // Write Ledger Entries
+            let currentBalance = 0;
+            if (!ledgerSnap.empty) currentBalance = ledgerSnap.docs[0].data().balanceAfter;
+
+            if (!earningDoc.exists && amount > 0) {
+                const balanceAfterEarning = currentBalance + amount;
+                t.set(earningRef, {
+                    ledgerId: earningId, userId: providerId, userType: providerType, bookingId,
+                    entryType: 'EARNING', direction: 'CREDIT', amount,
+                    paymentMode: d.payment.mode, paymentStatusAtEvent: 'CAPTURED', // Assumed captured/settled
+                    balanceBefore: currentBalance, balanceAfter: balanceAfterEarning,
+                    idempotencyKey: earningId, metadata: { triggeredBy: 'system' }, createdAt: now
+                });
+                currentBalance = balanceAfterEarning;
+
+                const commAmount = amount * 0.10; // 10%
+                const balanceAfterComm = currentBalance - commAmount;
+
+                // Ensure sequence for ordering
+                const commTime = new Timestamp(now.seconds, now.nanoseconds + 1000);
+
+                t.set(commRef, {
+                    ledgerId: commId, userId: providerId, userType: providerType, bookingId,
+                    entryType: 'COMMISSION', direction: 'DEBIT', amount: commAmount,
+                    paymentMode: d.payment.mode, paymentStatusAtEvent: 'CAPTURED',
+                    balanceBefore: currentBalance, balanceAfter: balanceAfterComm,
+                    idempotencyKey: commId, metadata: { triggeredBy: 'system' }, createdAt: commTime
+                });
+            }
 
             if (d.payment && d.payment.mode === 'ONLINE' && d.payment.status === 'AUTHORIZED') {
                 await capturePayment(t, bookingRef, d);
@@ -580,7 +647,7 @@ exports.completeBooking = functions.https.onCall(async (data, context) => {
 
 exports.cancelBooking = functions.https.onCall(async (data, context) => {
     const uid = requireAuth(context);
-    const { bookingId, cityId } = data; // Optional Reason?
+    const { bookingId, cityId } = data;
     const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
 
     try {
@@ -591,30 +658,54 @@ exports.cancelBooking = functions.https.onCall(async (data, context) => {
 
             if (d.customerId !== uid) throw new functions.https.HttpsError('permission-denied', 'Not yours');
 
-            // Allow Cancellation in which states?
-            // Usually Created, Assigned, Confirmed. Not Completed.
             if (['FAILED', 'CANCELLED'].includes(d.status)) throw new functions.https.HttpsError('failed-precondition', 'Cannot cancel final state');
 
             const now = Timestamp.now();
 
-            t.update(bookingRef, { status: 'CANCELLED', updatedAt: now });
-            t.set(bookingRef.collection('status_events').doc(), {
-                from: d.status, to: 'CANCELLED', actor: 'customer', actorId: uid, timestamp: now
-            });
-
+            // Refund Check First (Reads must come before Writes)
             const payment = d.payment;
             if (payment && payment.mode === 'ONLINE') {
                 if (payment.status === 'CAPTURED') {
                     await processRefund(t, bookingRef, d);
                 }
-                // If AUTHORIZED, do nothing (Auth expires). Status remains AUTHORIZED.
             }
+
+            t.update(bookingRef, { status: 'CANCELLED', updatedAt: now });
+            t.set(bookingRef.collection('status_events').doc(), {
+                from: d.status, to: 'CANCELLED', actor: 'customer', actorId: uid, timestamp: now
+            });
         });
         return { status: 'CANCELLED' };
     } catch (e) {
         if (e instanceof functions.https.HttpsError) throw e;
         throw new functions.https.HttpsError('internal', e.message);
     }
+});
+
+exports.onFreelancerAssignmentTimeout = functions.tasks.taskQueue({
+    retryConfig: { maxAttempts: 1 },
+    rateLimits: { maxConcurrentDispatches: 6 }
+}).onDispatch(async (data) => {
+    const { bookingId, cityId } = data;
+    const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
+
+    try {
+        await db.runTransaction(async (t) => {
+            const doc = await t.get(bookingRef);
+            if (!doc.exists) return;
+            const d = doc.data();
+
+            if (d.status === 'ASSIGNED') {
+                const replacementResult = await findReplacement(t, d);
+                const now = Timestamp.now();
+                t.set(bookingRef.collection('status_events').doc(), { from: 'ASSIGNED', to: 'TIMEOUT', actor: 'system', timestamp: now });
+                writeReassignment(t, bookingRef, d, replacementResult, now);
+            }
+        });
+
+        const outputDoc = await bookingRef.get();
+        if (outputDoc.exists && outputDoc.data().status === 'ASSIGNED') await enqueueAssignmentTimeout(bookingId, cityId);
+    } catch (e) { }
 });
 
 exports.acceptBooking = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
