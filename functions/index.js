@@ -17,7 +17,6 @@ const db = admin.firestore();
 
 // ============================================
 // HELPER: Require Authentication
-// ============================================
 function requireAuth(context) {
     if (!context.auth) {
         throw new functions.https.HttpsError(
@@ -65,6 +64,57 @@ function validateBookingInput(data) {
 }
 
 // ============================================
+// HELPER: Find Best Freelancer (Read-Only)
+// ============================================
+/**
+ * Internal Helper: Find Best Freelancer (Read-Only)
+ * 
+ * Logic:
+ * 1. Find eligible freelancers (Active, Online, Matching Service, Same City)
+ * 2. Sort by Tier (Gold > Silver > Bronze) then Last Active (Asc)
+ * 3. Return top match or null
+ * 
+ * @returns {Object|null} Freelancer data with id, or null
+ */
+async function findBestFreelancer(transaction, cityId, serviceCategory) {
+    // 1. Query Eligible Freelancers
+    const freelancersRef = db.collection(`cities/${cityId}/freelancers`);
+    const q = freelancersRef
+        .where('status', '==', 'active')
+        .where('isOnline', '==', true)
+        .where('serviceCategories', 'array-contains', serviceCategory);
+
+    // READ within transaction
+    const snapshot = await transaction.get(q);
+
+    if (snapshot.empty) {
+        return null;
+    }
+
+    // 2. Sort Freelancers (In-Memory)
+    const freelancers = [];
+    snapshot.forEach(doc => {
+        freelancers.push({ id: doc.id, ...doc.data() });
+    });
+
+    const tierScore = { 'gold': 3, 'silver': 2, 'bronze': 1 };
+
+    freelancers.sort((a, b) => {
+        // Primary: Tier (Desc)
+        const scoreA = tierScore[a.priorityTier] || 0;
+        const scoreB = tierScore[b.priorityTier] || 0;
+        if (scoreA !== scoreB) return scoreB - scoreA;
+
+        // Secondary: Last Active (Asc) - Earliest first
+        const timeA = a.lastActiveAt?.toMillis?.() || 0;
+        const timeB = b.lastActiveAt?.toMillis?.() || 0;
+        return timeA - timeB;
+    });
+
+    return freelancers[0];
+}
+
+// ============================================
 // BOOKING FUNCTIONS
 // ============================================
 
@@ -86,6 +136,7 @@ function validateBookingInput(data) {
 exports.createBooking = functions.https.onCall(async (data, context) => {
     // 1. Require authentication
     const uid = requireAuth(context);
+    const { type, cityId, serviceId, scheduledAt, idempotencyKey } = data;
 
     functions.logger.info('createBooking called', { uid, data });
 
@@ -98,8 +149,6 @@ exports.createBooking = functions.https.onCall(async (data, context) => {
             `Invalid booking data: ${validationErrors.join(', ')}`
         );
     }
-
-    const { type, cityId, serviceId, scheduledAt, idempotencyKey } = data;
 
     // 3. Validate user has activeRole = "customer"
     const userDoc = await db.doc(`users/${uid}`).get();
@@ -122,7 +171,19 @@ exports.createBooking = functions.https.onCall(async (data, context) => {
         );
     }
 
-    // 4. Check idempotency (if key provided)
+    // 4. Validate Service & Get Category
+    const serviceDoc = await db.doc(`cities/${cityId}/services/${serviceId}`).get();
+    if (!serviceDoc.exists) {
+        throw new functions.https.HttpsError('not-found', 'Service not found.');
+    }
+    const serviceData = serviceDoc.data();
+    const serviceCategory = serviceData.category;  // e.g., "haircut", "facial"
+
+    if (!serviceCategory) {
+        throw new functions.https.HttpsError('failed-precondition', 'Service has no category.');
+    }
+
+    // 5. Check idempotency (if key provided)
     if (idempotencyKey) {
         const existingBooking = await db
             .collection(`cities/${cityId}/bookings`)
@@ -144,7 +205,7 @@ exports.createBooking = functions.https.onCall(async (data, context) => {
         }
     }
 
-    // 5. Create booking in transaction
+    // 6. Create booking in transaction
     const bookingRef = db.collection(`cities/${cityId}/bookings`).doc();
     const bookingId = bookingRef.id;
     const now = FieldValue.serverTimestamp();
@@ -164,6 +225,7 @@ exports.createBooking = functions.https.onCall(async (data, context) => {
         customerId: uid,
         type,
         serviceId,
+        serviceCategory, // Storing category for easier lookups
         cityId,
         scheduledAt: scheduledTimestamp,
         status: 'CREATED',
@@ -181,29 +243,85 @@ exports.createBooking = functions.https.onCall(async (data, context) => {
     };
 
     try {
-        await db.runTransaction(async (transaction) => {
-            // Create booking document
+        const result = await db.runTransaction(async (transaction) => {
+            let assignedFreelancer = null;
+            let assignmentStatus = 'CREATED';
+
+            // A. Read: Find Freelancer (Home Bookings Only)
+            if (type === 'home') {
+                assignedFreelancer = await findBestFreelancer(
+                    transaction,
+                    cityId,
+                    serviceCategory
+                );
+
+                if (assignedFreelancer) {
+                    assignmentStatus = 'ASSIGNED';
+                    bookingData.freelancerId = assignedFreelancer.id;
+                    bookingData.status = 'ASSIGNED';
+                } else {
+                    assignmentStatus = 'FAILED';
+                    bookingData.status = 'FAILED';
+                    bookingData.failureReason = 'NO_FREELANCER_AVAILABLE';
+                }
+            }
+
+            // B. Write: Create booking document
             transaction.set(bookingRef, bookingData);
 
-            // Create status event subcollection entry
-            const statusEventRef = bookingRef.collection('status_events').doc();
-            transaction.set(statusEventRef, statusEventData);
+            // C. Write: Create status event (CREATED)
+            const createdEventRef = bookingRef.collection('status_events').doc();
+            transaction.set(createdEventRef, statusEventData);
+
+            // D. Write: Assignment Status Event (if home booking)
+            if (type === 'home') {
+                const assignEventRef = bookingRef.collection('status_events').doc();
+                if (assignedFreelancer) {
+                    transaction.set(assignEventRef, {
+                        from: 'CREATED',
+                        to: 'ASSIGNED',
+                        actor: 'system',
+                        timestamp: now,
+                        freelancerId: assignedFreelancer.id
+                    });
+                } else {
+                    transaction.set(assignEventRef, {
+                        from: 'CREATED',
+                        to: 'FAILED',
+                        actor: 'system',
+                        timestamp: now,
+                        reason: 'NO_FREELANCER_AVAILABLE'
+                    });
+                }
+            }
+
+            return {
+                bookingId,
+                status: assignmentStatus
+            };
         });
 
-        functions.logger.info('Booking created successfully', {
+        functions.logger.info('Booking process completed', {
             bookingId,
-            customerId: uid,
-            type,
-            cityId,
-            serviceId
+            status: result.status
         });
 
-        return {
-            bookingId,
-            status: 'CREATED',
-        };
+        // 7. Handle Assignment Failure
+        if (result.status === 'FAILED') {
+            throw new functions.https.HttpsError(
+                'resource-exhausted',
+                'NO_FREELANCER_AVAILABLE'
+            );
+        }
+
+        return result;
 
     } catch (error) {
+        // Re-throw HttpsErrors logic
+        if (error.code === 'resource-exhausted') {
+            throw error;
+        }
+
         functions.logger.error('Failed to create booking', {
             uid,
             error: error.message,
@@ -658,6 +776,5 @@ exports.healthCheck = functions.https.onCall((_data, _context) => {
         status: 'OK',
         timestamp: new Date().toISOString(),
         runtime: 'Node.js 18',
-        project: 'jayple-app-2026',
     };
 });
