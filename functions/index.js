@@ -162,16 +162,12 @@ async function enqueueAssignmentTimeout(bookingId, cityId) {
 }
 
 // ============================================
-// PAYMENT FUNCTIONS
+// PAYMENT FUNCTIONS & HELPERS
 // ============================================
 
-/**
- * Internal Helper: Capture Payment
- * Callable only by SYSTEM (internal logic)
- */
 async function capturePayment(transaction, bookingRef, bookingData) {
     const payment = bookingData.payment;
-    if (!payment || payment.status !== 'AUTHORIZED') return; // Cannot capture if not authorized
+    if (!payment || payment.status !== 'AUTHORIZED') return;
 
     const now = Timestamp.now();
     const newPayment = {
@@ -184,10 +180,28 @@ async function capturePayment(transaction, bookingRef, bookingData) {
 
     const eventRef = bookingRef.collection('status_events').doc();
     transaction.set(eventRef, {
-        from: 'PAYMENT_AUTHORIZED',
-        to: 'PAYMENT_CAPTURED',
-        actor: 'system',
-        timestamp: now
+        from: 'PAYMENT_AUTHORIZED', to: 'PAYMENT_CAPTURED', actor: 'system', timestamp: now
+    });
+}
+
+async function processRefund(transaction, bookingRef, bookingData) {
+    const payment = bookingData.payment;
+    if (payment.status !== 'CAPTURED') throw new functions.https.HttpsError('failed-precondition', 'Payment not CAPTURED');
+    if (payment.mode === 'OFFLINE') throw new functions.https.HttpsError('failed-precondition', 'Cannot refund OFFLINE');
+
+    const now = Timestamp.now();
+    const newPayment = {
+        ...payment,
+        status: 'REFUNDED',
+        providerRef: `MOCK_REFUND_${now.toMillis()}`, // Mock Refund Ref
+        updatedAt: now
+    };
+
+    transaction.update(bookingRef, { payment: newPayment });
+
+    const eventRef = bookingRef.collection('status_events').doc();
+    transaction.set(eventRef, {
+        from: 'PAYMENT_CAPTURED', to: 'PAYMENT_REFUNDED', actor: 'system', timestamp: now
     });
 }
 
@@ -221,13 +235,74 @@ exports.authorizePayment = functions.https.onCall(async (data, context) => {
 
             const eventRef = bookingRef.collection('status_events').doc();
             t.set(eventRef, {
-                from: 'PAYMENT_PENDING',
-                to: 'PAYMENT_AUTHORIZED',
-                actor: 'customer',
-                timestamp: now
+                from: 'PAYMENT_PENDING', to: 'PAYMENT_AUTHORIZED', actor: 'customer', timestamp: now
             });
         });
         return { bookingId, paymentStatus: 'AUTHORIZED' };
+    } catch (e) {
+        if (e instanceof functions.https.HttpsError) throw e;
+        throw new functions.https.HttpsError('internal', e.message);
+    }
+});
+
+exports.failPayment = functions.https.onCall(async (data, context) => {
+    requireAuth(context); // System/Internal user in production, any Auth in mock
+    const { bookingId, cityId } = data;
+    const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
+
+    try {
+        await db.runTransaction(async (t) => {
+            const doc = await t.get(bookingRef);
+            if (!doc.exists) throw new functions.https.HttpsError('not-found', 'Not found');
+            const d = doc.data();
+            const payment = d.payment;
+
+            if (d.status === 'COMPLETED') throw new functions.https.HttpsError('failed-precondition', 'Booking COMPLETED');
+            if (payment.mode === 'OFFLINE') throw new functions.https.HttpsError('failed-precondition', 'OFFLINE payment');
+            if (payment.status !== 'AUTHORIZED') throw new functions.https.HttpsError('failed-precondition', 'Not AUTHORIZED');
+            if (payment.status === 'CAPTURED') throw new functions.https.HttpsError('failed-precondition', 'Already CAPTURED');
+
+            const now = Timestamp.now();
+            const newPayment = {
+                ...payment,
+                status: 'FAILED',
+                updatedAt: now
+            };
+
+            t.update(bookingRef, { status: 'FAILED', failureReason: 'PAYMENT_FAILED', payment: newPayment, updatedAt: now });
+
+            // Payment Event
+            t.set(bookingRef.collection('status_events').doc(), {
+                from: 'PAYMENT_AUTHORIZED', to: 'PAYMENT_FAILED', actor: 'system', timestamp: now
+            });
+            // Booking Event
+            t.set(bookingRef.collection('status_events').doc(), {
+                from: d.status, to: 'FAILED', actor: 'system', reason: 'PAYMENT_FAILED', timestamp: now
+            });
+        });
+        return { status: 'FAILED', paymentStatus: 'FAILED' };
+    } catch (e) {
+        if (e instanceof functions.https.HttpsError) throw e;
+        throw new functions.https.HttpsError('internal', e.message);
+    }
+});
+
+exports.refundPayment = functions.https.onCall(async (data, context) => {
+    requireAuth(context);
+    const { bookingId, cityId } = data;
+    const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
+
+    try {
+        await db.runTransaction(async (t) => {
+            const doc = await t.get(bookingRef);
+            if (!doc.exists) throw new functions.https.HttpsError('not-found', 'Not found');
+            const d = doc.data();
+
+            if (!['CANCELLED', 'FAILED'].includes(d.status)) throw new functions.https.HttpsError('failed-precondition', 'Booking must be CANCELLED or FAILED');
+
+            await processRefund(t, bookingRef, d);
+        });
+        return { paymentStatus: 'REFUNDED' };
     } catch (e) {
         if (e instanceof functions.https.HttpsError) throw e;
         throw new functions.https.HttpsError('internal', e.message);
@@ -351,7 +426,7 @@ exports.getMyBookings = functions.https.onCall(async (data, context) => {
         bookingId: d.bookingId, type: d.type, status: d.status, serviceId: d.serviceId,
         cityId: d.cityId, freelancerId: d.freelancerId,
         scheduledAt: d.scheduledAt?.toDate?.().toISOString(), createdAt: d.createdAt?.toDate?.().toISOString(),
-        payment: d.payment // Expose payment info
+        payment: d.payment
     });
     return { bookings: snap.docs.map(d => sanitize(d.data())) };
 });
@@ -482,7 +557,6 @@ exports.completeBooking = functions.https.onCall(async (data, context) => {
             if (d.freelancerId !== uid && d.vendorId !== uid && d.salonId !== uid)
                 throw new functions.https.HttpsError('permission-denied', 'Denied');
 
-            // Allow re-completion? No, strictly transitions.
             if (d.status !== 'CONFIRMED' && d.status !== 'IN_PROGRESS')
                 throw new functions.https.HttpsError('failed-precondition', `Invalid status ${d.status}`);
 
@@ -493,7 +567,6 @@ exports.completeBooking = functions.https.onCall(async (data, context) => {
                 from: d.status, to: 'COMPLETED', actor: 'provider', actorId: uid, timestamp: now
             });
 
-            // Capture Payment if needed
             if (d.payment && d.payment.mode === 'ONLINE' && d.payment.status === 'AUTHORIZED') {
                 await capturePayment(t, bookingRef, d);
             }
@@ -505,9 +578,46 @@ exports.completeBooking = functions.https.onCall(async (data, context) => {
     }
 });
 
+exports.cancelBooking = functions.https.onCall(async (data, context) => {
+    const uid = requireAuth(context);
+    const { bookingId, cityId } = data; // Optional Reason?
+    const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
+
+    try {
+        await db.runTransaction(async (t) => {
+            const doc = await t.get(bookingRef);
+            if (!doc.exists) throw new functions.https.HttpsError('not-found', 'Not found');
+            const d = doc.data();
+
+            if (d.customerId !== uid) throw new functions.https.HttpsError('permission-denied', 'Not yours');
+
+            // Allow Cancellation in which states?
+            // Usually Created, Assigned, Confirmed. Not Completed.
+            if (['FAILED', 'CANCELLED'].includes(d.status)) throw new functions.https.HttpsError('failed-precondition', 'Cannot cancel final state');
+
+            const now = Timestamp.now();
+
+            t.update(bookingRef, { status: 'CANCELLED', updatedAt: now });
+            t.set(bookingRef.collection('status_events').doc(), {
+                from: d.status, to: 'CANCELLED', actor: 'customer', actorId: uid, timestamp: now
+            });
+
+            const payment = d.payment;
+            if (payment && payment.mode === 'ONLINE') {
+                if (payment.status === 'CAPTURED') {
+                    await processRefund(t, bookingRef, d);
+                }
+                // If AUTHORIZED, do nothing (Auth expires). Status remains AUTHORIZED.
+            }
+        });
+        return { status: 'CANCELLED' };
+    } catch (e) {
+        if (e instanceof functions.https.HttpsError) throw e;
+        throw new functions.https.HttpsError('internal', e.message);
+    }
+});
+
 exports.acceptBooking = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
-exports.rejectBooking = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
-exports.cancelBooking = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
 exports.submitReview = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
 exports.switchRole = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
 exports.healthCheck = functions.https.onCall(() => ({ status: 'OK', timestamp: new Date().toISOString() }));
