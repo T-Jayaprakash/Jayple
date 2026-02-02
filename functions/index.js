@@ -162,6 +162,80 @@ async function enqueueAssignmentTimeout(bookingId, cityId) {
 }
 
 // ============================================
+// PAYMENT FUNCTIONS
+// ============================================
+
+/**
+ * Internal Helper: Capture Payment
+ * Callable only by SYSTEM (internal logic)
+ */
+async function capturePayment(transaction, bookingRef, bookingData) {
+    const payment = bookingData.payment;
+    if (!payment || payment.status !== 'AUTHORIZED') return; // Cannot capture if not authorized
+
+    const now = Timestamp.now();
+    const newPayment = {
+        ...payment,
+        status: 'CAPTURED',
+        updatedAt: now
+    };
+
+    transaction.update(bookingRef, { payment: newPayment });
+
+    const eventRef = bookingRef.collection('status_events').doc();
+    transaction.set(eventRef, {
+        from: 'PAYMENT_AUTHORIZED',
+        to: 'PAYMENT_CAPTURED',
+        actor: 'system',
+        timestamp: now
+    });
+}
+
+exports.authorizePayment = functions.https.onCall(async (data, context) => {
+    const uid = requireAuth(context);
+    const { bookingId, cityId } = data;
+    const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
+
+    try {
+        await db.runTransaction(async (t) => {
+            const doc = await t.get(bookingRef);
+            if (!doc.exists) throw new functions.https.HttpsError('not-found', 'Not found');
+            const d = doc.data();
+
+            if (d.customerId !== uid) throw new functions.https.HttpsError('permission-denied', 'Not yours');
+            if (d.status !== 'CONFIRMED') throw new functions.https.HttpsError('failed-precondition', 'Must be CONFIRMED');
+
+            const payment = d.payment || {};
+            if (payment.mode !== 'ONLINE') throw new functions.https.HttpsError('failed-precondition', 'Not ONLINE');
+            if (payment.status !== 'PENDING') throw new functions.https.HttpsError('failed-precondition', `Status ${payment.status}`);
+
+            const now = Timestamp.now();
+            const newPayment = {
+                ...payment,
+                status: 'AUTHORIZED',
+                providerRef: `MOCK_AUTH_${now.toMillis()}`,
+                updatedAt: now
+            };
+
+            t.update(bookingRef, { payment: newPayment });
+
+            const eventRef = bookingRef.collection('status_events').doc();
+            t.set(eventRef, {
+                from: 'PAYMENT_PENDING',
+                to: 'PAYMENT_AUTHORIZED',
+                actor: 'customer',
+                timestamp: now
+            });
+        });
+        return { bookingId, paymentStatus: 'AUTHORIZED' };
+    } catch (e) {
+        if (e instanceof functions.https.HttpsError) throw e;
+        throw new functions.https.HttpsError('internal', e.message);
+    }
+});
+
+
+// ============================================
 // BOOKING FUNCTIONS
 // ============================================
 
@@ -177,7 +251,9 @@ exports.createBooking = functions.https.onCall(async (data, context) => {
 
     const serviceDoc = await db.doc(`cities/${cityId}/services/${serviceId}`).get();
     if (!serviceDoc.exists) throw new functions.https.HttpsError('not-found', 'Service not found.');
-    const serviceCategory = serviceDoc.data().category;
+    const serviceData = serviceDoc.data();
+    const serviceCategory = serviceData.category;
+    const price = serviceData.price || 0;
 
     if (idempotencyKey) {
         const existing = await db.collection(`cities/${cityId}/bookings`).where('idempotencyKey', '==', idempotencyKey).limit(1).get();
@@ -193,10 +269,22 @@ exports.createBooking = functions.https.onCall(async (data, context) => {
     else if (scheduledAt._seconds) scheduledTimestamp = new Timestamp(scheduledAt._seconds, scheduledAt._nanoseconds || 0);
     else scheduledTimestamp = Timestamp.fromDate(new Date(scheduledAt));
 
+    const paymentMode = type === 'home' ? 'ONLINE' : 'OFFLINE';
+    const paymentStatus = paymentMode === 'ONLINE' ? 'PENDING' : 'NOT_REQUIRED';
+
     const bookingData = {
         bookingId, customerId: uid, type, serviceId, serviceCategory, cityId,
         scheduledAt: scheduledTimestamp, status: 'CREATED', idempotencyKey: idempotencyKey || null,
-        createdAt: now, updatedAt: now, assignmentAttempts: []
+        createdAt: now, updatedAt: now, assignmentAttempts: [],
+        payment: {
+            mode: paymentMode,
+            status: paymentStatus,
+            amount: price,
+            currency: 'INR',
+            provider: 'MOCK',
+            providerRef: null,
+            updatedAt: now
+        }
     };
 
     try {
@@ -262,7 +350,8 @@ exports.getMyBookings = functions.https.onCall(async (data, context) => {
     const sanitize = d => ({
         bookingId: d.bookingId, type: d.type, status: d.status, serviceId: d.serviceId,
         cityId: d.cityId, freelancerId: d.freelancerId,
-        scheduledAt: d.scheduledAt?.toDate?.().toISOString(), createdAt: d.createdAt?.toDate?.().toISOString()
+        scheduledAt: d.scheduledAt?.toDate?.().toISOString(), createdAt: d.createdAt?.toDate?.().toISOString(),
+        payment: d.payment // Expose payment info
     });
     return { bookings: snap.docs.map(d => sanitize(d.data())) };
 });
@@ -278,7 +367,8 @@ exports.getBookingById = functions.https.onCall(async (data, context) => {
     return {
         booking: {
             bookingId: d.bookingId, type: d.type, status: d.status, serviceId: d.serviceId, cityId: d.cityId, freelancerId: d.freelancerId, assignmentAttempts: d.assignmentAttempts,
-            scheduledAt: d.scheduledAt?.toDate?.().toISOString(), createdAt: d.createdAt?.toDate?.().toISOString()
+            scheduledAt: d.scheduledAt?.toDate?.().toISOString(), createdAt: d.createdAt?.toDate?.().toISOString(),
+            payment: d.payment
         }
     };
 });
@@ -299,13 +389,12 @@ exports.freelancerRespondToBooking = functions.https.onCall(async (data, context
             if (d.status !== 'ASSIGNED') throw new functions.https.HttpsError('failed-precondition', `Status ${d.status}.`);
             if (d.freelancerId !== uid) throw new functions.https.HttpsError('permission-denied', 'Not yours.');
 
-            // Look for replacement NOW (Must be before Writes)
             let replacementResult = null;
             if (action === 'REJECT') {
                 replacementResult = await findReplacement(t, d);
             }
 
-            const now = Timestamp.now(); // Use Concrete Timestamp for Array compatibility
+            const now = Timestamp.now();
 
             if (action === 'ACCEPT') {
                 t.update(bookingRef, { status: 'CONFIRMED', updatedAt: now });
@@ -314,12 +403,9 @@ exports.freelancerRespondToBooking = functions.https.onCall(async (data, context
                 });
                 return { status: 'CONFIRMED' };
             } else {
-                // REJECT
                 t.set(bookingRef.collection('status_events').doc(), {
                     from: 'ASSIGNED', to: 'REJECTED', actor: 'freelancer', actorId: uid, timestamp: now
                 });
-
-                // writes based on replacementResult (Already Read)
                 return writeReassignment(t, bookingRef, d, replacementResult, now);
             }
         });
@@ -347,7 +433,7 @@ exports.onFreelancerAssignmentTimeout = functions.tasks.taskQueue({
 
             if (d.status === 'ASSIGNED') {
                 const replacementResult = await findReplacement(t, d);
-                const now = Timestamp.now(); // Use Concrete Timestamp
+                const now = Timestamp.now();
 
                 t.set(bookingRef.collection('status_events').doc(), {
                     from: 'ASSIGNED', to: 'TIMEOUT', actor: 'system', timestamp: now
@@ -382,10 +468,46 @@ exports.vendorRespondToBooking = functions.https.onCall(async (data, context) =>
     } catch (e) { throw new functions.https.HttpsError('internal', e.message); }
 });
 
+exports.completeBooking = functions.https.onCall(async (data, context) => {
+    const uid = requireAuth(context);
+    const { bookingId, cityId } = data;
+    const bookingRef = db.doc(`cities/${cityId}/bookings/${bookingId}`);
+
+    try {
+        await db.runTransaction(async (t) => {
+            const doc = await t.get(bookingRef);
+            if (!doc.exists) throw new functions.https.HttpsError('not-found', 'Not found');
+            const d = doc.data();
+
+            if (d.freelancerId !== uid && d.vendorId !== uid && d.salonId !== uid)
+                throw new functions.https.HttpsError('permission-denied', 'Denied');
+
+            // Allow re-completion? No, strictly transitions.
+            if (d.status !== 'CONFIRMED' && d.status !== 'IN_PROGRESS')
+                throw new functions.https.HttpsError('failed-precondition', `Invalid status ${d.status}`);
+
+            const now = Timestamp.now();
+
+            t.update(bookingRef, { status: 'COMPLETED', updatedAt: now });
+            t.set(bookingRef.collection('status_events').doc(), {
+                from: d.status, to: 'COMPLETED', actor: 'provider', actorId: uid, timestamp: now
+            });
+
+            // Capture Payment if needed
+            if (d.payment && d.payment.mode === 'ONLINE' && d.payment.status === 'AUTHORIZED') {
+                await capturePayment(t, bookingRef, d);
+            }
+        });
+        return { status: 'COMPLETED' };
+    } catch (e) {
+        if (e instanceof functions.https.HttpsError) throw e;
+        throw new functions.https.HttpsError('internal', e.message);
+    }
+});
+
 exports.acceptBooking = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
 exports.rejectBooking = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
 exports.cancelBooking = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
-exports.completeBooking = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
 exports.submitReview = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
 exports.switchRole = functions.https.onCall(() => ({ status: 'NOT_IMPLEMENTED' }));
 exports.healthCheck = functions.https.onCall(() => ({ status: 'OK', timestamp: new Date().toISOString() }));
