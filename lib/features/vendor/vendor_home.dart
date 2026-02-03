@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../../core/auth/auth_service.dart';
 import 'vendor_booking_list_screen.dart';
+import 'vendor_earnings_screen.dart';
 
 class VendorHome extends StatelessWidget {
   const VendorHome({super.key});
@@ -40,7 +41,25 @@ class VendorHome extends StatelessWidget {
                     MaterialPageRoute(builder: (_) => const VendorBookingListScreen())
                 );
               },
-            )
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.account_balance_wallet),
+              label: const Text('My Earnings'),
+              style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 54, vertical: 16),
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.blueGrey,
+                  side: const BorderSide(color: Colors.grey),
+                  textStyle: const TextStyle(fontSize: 16),
+              ),
+              onPressed: () {
+                Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const VendorEarningsScreen())
+                );
+              },
+            ),
           ],
         ),
       ),

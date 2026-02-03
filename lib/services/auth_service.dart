@@ -1,7 +1,9 @@
+import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:flutter/foundation.dart';
-import '../models/user.dart' as user_model;
+import '../core/auth/user_model.dart' as auth_model;
+import '../features/auth/auth_controller.dart';
+import '../features/auth/otp_screen.dart';
 
 class AuthService {
   static final AuthService instance = AuthService._internal();
@@ -15,122 +17,155 @@ class AuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
-  // Verify Phone Number
-  Future<void> verifyPhoneNumber({
+  // 1. Send OTP (Strict Orchestration)
+  Future<void> sendOtp({
+    required BuildContext context,
     required String phoneNumber,
-    required Function(String, int?) onCodeSent,
-    required Function(FirebaseAuthException) onVerificationFailed,
-    required Function(String) onCodeAutoRetrievalTimeout,
+    bool silent = false, // If true, won't navigate (for resend)
   }) async {
+    // Prevent re-triggering if already sent to same number recently?
+    // For now, we trust the UI to disable buttons, but we clear state first.
+    AuthController.instance.setPhoneNumber(phoneNumber);
+    
+    // Show loader? - handled by UI usually, but we could show dialog if strictly required. 
+    // Assuming UI shows loader while awaiting this Future.
+
     await _auth.verifyPhoneNumber(
       phoneNumber: phoneNumber,
-      verificationCompleted: (PhoneAuthCredential credential) async {
-        // Auto-resolution (mostly Android)
-        await _auth.signInWithCredential(credential);
-      },
-      verificationFailed: onVerificationFailed,
-      codeSent: onCodeSent,
-      codeAutoRetrievalTimeout: onCodeAutoRetrievalTimeout,
-    );
-  }
-
-  // Verify OTP and Sign In
-  Future<UserCredential> signInWithOTP({
-    required String verificationId,
-    required String smsCode,
-  }) async {
-    PhoneAuthCredential credential = PhoneAuthProvider.credential(
-      verificationId: verificationId,
-      smsCode: smsCode,
-    );
-    return await _auth.signInWithCredential(credential);
-  }
-
-  // Check if User Profile exists and get Role
-  Future<String?> getUserRole(String uid) async {
-    try {
-      DocumentSnapshot doc = await _firestore.collection('users').doc(uid).get();
-      if (doc.exists) {
-        return doc.get('role') as String?;
-      }
-      return null; // User exists in Auth but not in Firestore (needs role selection)
-    } catch (e) {
-      debugPrint('Error getting user role: $e');
-      return null;
-    }
-  }
-
-  // Create User Profile
-  Future<void> createUserProfile(String uid, String role, String phoneNumber) async {
-    await _firestore.collection('users').doc(uid).set({
-      'phoneNumber': phoneNumber,
-      'role': role,
-      'createdAt': FieldValue.serverTimestamp(),
-    });
-  }
-
-  // Get User Profile (Full object)
-  Future<user_model.User?> getUserProfile() async {
-    try {
-      final user = _auth.currentUser;
-      if (user == null) return null;
+      forceResendingToken: AuthController.instance.resendToken,
       
-      final doc = await _firestore.collection('users').doc(user.uid).get();
-      if (doc.exists) {
-        final data = doc.data()!;
-        data['id'] = user.uid; // Ensure ID is present
-        return user_model.User.fromJson(data);
+      // A. Verification Completed (Auto-resolve)
+      verificationCompleted: (PhoneAuthCredential credential) async {
+        debugPrint('AuthService: Auto-verification completed');
+        await _signInWithCredential(context, credential);
+      },
+
+      // B. Verification Failed
+      verificationFailed: (FirebaseAuthException e) {
+        debugPrint('AuthService: Verification Failed: ${e.message}');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Verification Failed: ${e.message}')),
+        );
+      },
+
+      // C. Code Sent (Navigate HERE)
+      codeSent: (String verificationId, int? resendToken) {
+        debugPrint('AuthService: Code Sent. Silent: $silent');
+        AuthController.instance.setVerificationId(verificationId);
+        AuthController.instance.setResendToken(resendToken);
+
+        if (!silent) {
+          // Navigate ONLY if not silent
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => const OtpScreen(),
+            ),
+          );
+        } else {
+             ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('OTP Resent Successfully')),
+             );
+        }
+      },
+
+      // D. Timeout
+      codeAutoRetrievalTimeout: (String verificationId) {
+        debugPrint('AuthService: Timeout. VerificationId: $verificationId');
+        AuthController.instance.setVerificationId(verificationId);
+      },
+    );
+  }
+
+  // 2. Verify OTP
+  Future<void> verifyOtp({
+    required BuildContext context,
+    required String otp,
+  }) async {
+    final verId = AuthController.instance.verificationId;
+    if (verId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Error: No Verification ID found')),
+      );
+      return;
+    }
+
+    final credential = PhoneAuthProvider.credential(
+      verificationId: verId,
+      smsCode: otp,
+    );
+
+    await _signInWithCredential(context, credential);
+  }
+
+  // Internal Sign-In Helper
+  Future<void> _signInWithCredential(BuildContext context, PhoneAuthCredential credential) async {
+    try {
+      final UserCredential userCredential = await _auth.signInWithCredential(credential);
+      
+      if (userCredential.user != null) {
+        await ensureUserDocumentExists(userCredential.user!);
+        
+        // Navigation is handled by AuthGate automatically when auth state changes.
+        // But if we are deep in the stack, we might want to pop to root.
+        // However, AuthGate is usually the root. 
+        // We will pop the OTP screen to let AuthGate take over or just let AuthGate rebuild.
+        // Better: Pop until first route? No, AuthGate will switch the tree.
+        // We just need to stop the loader.
+        Navigator.popUntil(context, (route) => route.isFirst);
       }
-      return null;
-    } catch (e) {
-      debugPrint('Error getting profile: $e');
-      return null;
+    } on FirebaseAuthException catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Login Failed: ${e.message}')),
+      );
     }
   }
 
-  // Update Profile
-  Future<void> updateProfile({String? fullName, String? avatarUrl}) async {
-     try {
-       final user = _auth.currentUser;
-       if (user == null) return;
-       
-       final updates = <String, dynamic>{};
-       if (fullName != null) updates['full_name'] = fullName;
-       if (avatarUrl != null) updates['profile_url'] = avatarUrl;
-       
-       if (updates.isNotEmpty) {
-           await _firestore.collection('users').doc(user.uid).update(updates);
-       }
-     } catch (e) {
-       debugPrint('Error updating profile: $e');
-       throw e;
-     }
+  // 3. Sync User to Firestore (Requirement 4)
+  Future<void> ensureUserDocumentExists(User firebaseUser) async {
+    final userRef = _firestore.collection('users').doc(firebaseUser.uid);
+    final doc = await userRef.get();
+
+    final Map<String, dynamic> userData = {
+      'uid': firebaseUser.uid,
+      'phoneNumber': firebaseUser.phoneNumber,
+      'lastLoginAt': FieldValue.serverTimestamp(),
+      'role': 'user',
+      'roles': ['user'],
+      'status': 'active',
+      'isBlocked': false,
+    };
+
+    if (!doc.exists) {
+      userData['createdAt'] = FieldValue.serverTimestamp();
+      await userRef.set(userData);
+    } else {
+      await userRef.update({
+        'lastLoginAt': FieldValue.serverTimestamp(),
+        'phoneNumber': firebaseUser.phoneNumber,
+      });
+    }
   }
 
-  // Legacy adapter for login form widget
-  Future<void> signInWithPhone(String phoneNumber) async {
-      // Logic handled in UI via verifyPhoneNumber, this is a placeholder if needed
-      // or we can remove this if we fix the UI call site.
-      // But since check failed on undefined method:
-      throw UnimplementedError("Use verifyPhoneNumber with callbacks instead");
+  // Fetch AppUser for AuthGate
+  Future<auth_model.AppUser> fetchUser(String uid) async {
+    final doc = await _firestore.collection('users').doc(uid).get();
+    if (!doc.exists) {
+      final user = _auth.currentUser;
+      if (user != null && user.uid == uid) {
+        await ensureUserDocumentExists(user);
+        final freshDoc = await _firestore.collection('users').doc(uid).get();
+        return auth_model.AppUser.fromFirestore(freshDoc.data()!, uid);
+      }
+      throw Exception('User document not found');
+    }
+    return auth_model.AppUser.fromFirestore(doc.data()!, uid);
   }
 
-  // Legacy adapter
-  Future<UserCredential> verifyOtp({required String phone, required String token}) async {
-     // This signature assumes we have verificationId stored somewhere or passed differently
-     throw UnimplementedError("Use signInWithOTP with verificationId");
-  }
-  
-  // Create or Update Profile (merged)
-  Future<void> createOrUpdateUserProfile(user_model.User user) async {
-       await _firestore.collection('users').doc(user.id).set(user.toJson(), SetOptions(merge: true));
-  }
-
-  // Get Current User
   User? get currentUser => _auth.currentUser;
 
-  // Sign Out
   Future<void> signOut() async {
+    AuthController.instance.clear();
     await _auth.signOut();
   }
 }

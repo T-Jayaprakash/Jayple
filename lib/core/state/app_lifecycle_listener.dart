@@ -1,20 +1,20 @@
 import 'package:flutter/widgets.dart';
 
-class AppLifecycleListener extends StatefulWidget {
+class AppResumeListener extends StatefulWidget {
   final Widget child;
   final VoidCallback onAppResumed;
 
-  const AppLifecycleListener({
+  const AppResumeListener({
     super.key,
     required this.child,
     required this.onAppResumed,
   });
 
   @override
-  State<AppLifecycleListener> createState() => _AppLifecycleListenerState();
+  State<AppResumeListener> createState() => _AppResumeListenerState();
 }
 
-class _AppLifecycleListenerState extends State<AppLifecycleListener> with WidgetsBindingObserver {
+class _AppResumeListenerState extends State<AppResumeListener> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();

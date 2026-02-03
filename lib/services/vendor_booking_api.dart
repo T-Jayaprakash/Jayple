@@ -46,4 +46,53 @@ class VendorBookingApi {
       throw Exception('Action failed: $e');
     }
   }
+
+  Future<void> startBooking({
+    required String bookingId,
+    required String cityId,
+  }) async {
+    try {
+      // Per instructions, using completeBooking with action 'START' for starting service
+      final HttpsCallable callable = _functions.httpsCallable('completeBooking');
+      await callable.call({
+        'bookingId': bookingId,
+        'cityId': cityId,
+        'action': 'START',
+      });
+    } on FirebaseFunctionsException catch (e) {
+      throw Exception('${e.message} (${e.code})');
+    } catch (e) {
+      throw Exception('Failed to start service: $e');
+    }
+  }
+
+  Future<void> completeBooking({
+    required String bookingId,
+    required String cityId,
+  }) async {
+    try {
+      final HttpsCallable callable = _functions.httpsCallable('completeBooking');
+      await callable.call({
+        'bookingId': bookingId,
+        'cityId': cityId,
+        'action': 'COMPLETE',
+      });
+    } on FirebaseFunctionsException catch (e) {
+      throw Exception('${e.message} (${e.code})');
+    } catch (e) {
+      throw Exception('Failed to complete service: $e');
+    }
+  }
+
+  Future<Map<String, dynamic>> getVendorEarnings() async {
+    try {
+      final HttpsCallable callable = _functions.httpsCallable('getVendorEarningsSummary');
+      final result = await callable.call();
+      return Map<String, dynamic>.from(result.data as Map);
+    } on FirebaseFunctionsException catch (e) {
+      throw Exception('${e.message}');
+    } catch (e) {
+      throw Exception('Failed to load earnings: $e');
+    }
+  }
 }

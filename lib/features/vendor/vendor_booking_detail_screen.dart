@@ -24,10 +24,7 @@ class _VendorBookingDetailScreenState extends State<VendorBookingDetailScreen> {
       await VendorBookingApi().respondToBooking(
         bookingId: widget.bookingId,
         cityId: cityId,
-        action: action, // 'ACCEPT' or 'REJECT' (Wait, ensure case matches backend)
-        // Usually backend expects uppercase 'ACCEPT' or 'REJECT' or lowercase?
-        // Requirement says "calls vendorRespondToBooking (ACCEPT)".
-        // I will use Uppercase 'ACCEPT' / 'REJECT' as standard for constants.
+        action: action, 
       );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -40,6 +37,27 @@ class _VendorBookingDetailScreenState extends State<VendorBookingDetailScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('Action Failed: $e'), backgroundColor: Colors.red)
         );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  Future<void> _handleStatusUpdate(String action, String cityId) async {
+    setState(() => _isProcessing = true);
+    try {
+      if (action == 'START') {
+        await VendorBookingApi().startBooking(bookingId: widget.bookingId, cityId: cityId);
+      } else if (action == 'COMPLETE') {
+        await VendorBookingApi().completeBooking(bookingId: widget.bookingId, cityId: cityId);
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Status updated successfully.'), backgroundColor: Colors.green));
+        _refresh();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Update Failed: $e'), backgroundColor: Colors.red));
       }
     } finally {
       if (mounted) setState(() => _isProcessing = false);
@@ -84,10 +102,11 @@ class _VendorBookingDetailScreenState extends State<VendorBookingDetailScreen> {
                _buildDetailRow('Type', type?.toUpperCase(), isStatus: false),
                const Divider(height: 32),
                _buildDetailRow('Service', data['serviceCategory']),
-               _buildDetailRow('Time', '${data['scheduledAt']}'), // TODO: Format date
+               _buildDetailRow('Time', '${data['scheduledAt']}'), 
                _buildDetailRow('Customer', data['customerName'] ?? 'Guest'),
                _buildDetailRow('Amount', '₹${data['totalAmount']}'),
 
+               // Action Buttons based on Status
                if (canRespond) ...[
                  const SizedBox(height: 48),
                  Row(
@@ -121,12 +140,50 @@ class _VendorBookingDetailScreenState extends State<VendorBookingDetailScreen> {
                  ),
                  const SizedBox(height: 16),
                  const Text('Accepting this booking commits you to providing the service at the shop.', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey, fontSize: 12)),
+               
                ] else if (status == 'CONFIRMED') ...[
+                 const SizedBox(height: 48),
+                 SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blue, 
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 16),
+                        ),
+                        // B3.2: CONFIRMED -> Start Service
+                        onPressed: _isProcessing ? null : () => _handleStatusUpdate('START', cityId),
+                        child: _isProcessing 
+                            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                            : const Text('Start Service'),
+                    )
+                 ),
+
+               ] else if (status == 'IN_PROGRESS' || status == 'STARTED') ...[
+                 const SizedBox(height: 48),
+                 SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.purple, 
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 16),
+                        ),
+                        // B3.2: IN_PROGRESS -> Mark as Completed
+                        onPressed: _isProcessing ? null : () => _handleStatusUpdate('COMPLETE', cityId),
+                         child: _isProcessing 
+                            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                            : const Text('Mark as Completed'),
+                    )
+                 ),
+
+               ] else if (status == 'COMPLETED') ...[
                  const SizedBox(height: 32),
-                 const Center(child: Chip(label: Text('Booking Accepted'), backgroundColor: Colors.greenAccent))
-               ] else if (status == 'REJECTED') ...[
+                 const Center(child: Chip(label: Text('Service Completed'), backgroundColor: Colors.tealAccent))
+               
+               ] else if (status == 'REJECTED' || status == 'CANCELLED') ...[
                  const SizedBox(height: 32),
-                 const Center(child: Chip(label: Text('Booking Rejected'), backgroundColor: Colors.redAccent))
+                 Center(child: Chip(label: Text('Booking $status'), backgroundColor: Colors.grey[300]))
                ]
             ],
           );

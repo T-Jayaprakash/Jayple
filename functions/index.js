@@ -584,3 +584,8 @@ exports.acceptBooking = functions.https.onCall(() => ({}));
 exports.submitReview = functions.https.onCall(() => ({}));
 exports.switchRole = functions.https.onCall(() => ({}));
 exports.healthCheck = functions.https.onCall(() => ({ status: 'OK' }));
+
+// exports.seedTestData = functions.https.onRequest(async (req, res) => {
+//     // EVENTS ...
+//     res.send({ success: true, message: "Seed data created successfully (DISABLED)" });
+// });
